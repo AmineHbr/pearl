@@ -1,0 +1,983 @@
+#!/iPlanet/servers/ldap5/lib/nsPerl5.005_03/nsperl
+######################################################################################
+##
+##  - Nom du programme  :  extraction_peps.pl
+##	  Extraction des rôles PEPS pour envoi par mail
+##
+##  - fichiers en entree :   
+##    Aucun
+##
+##  - fichiers en sortie :  
+##    fichier CSV
+##
+##  - options : 
+##     - i : input file                                                OPT
+##     - v : verbose mode		                               OPT
+##     - c : fichier de config (txt)                                   OPT
+##     - o : fichier en données en sortie (csv)                        OPT
+##     - l : fichier de log (log)                                      OPT
+##     - s : force les accès annuaire en mode ldap au lieu de ldifde   OPT
+##     - t : désactive les accès annuaire => fichiers entrée existants OPT
+##
+##  02/05/2007 : CL - Création
+##  03/10/2007 : CL - Mise à jour pour afficher la pyramide managériale des personnes directement rattachées
+##                    à un département ou une direction
+##  05/12/2007 : CL - Evolution pour afficher toutes les personnes d'AXA France Services, y compris celles n'ayant pas de roles PEPS
+##  15/03/2010 : EFR - SER241565 modif du filtre axaahierarchieman
+##	15/03/2010 : EFR - SER241565-V2 déporter les destinataires du mail.
+##	23/04/2015 : BFR - SER402516 utilisation du code unité au lieu du libelle AXA France Service suite renommage en DSI AXA France
+######################################################################################
+
+use AXA::utils;
+use Getopt::Std;
+use File::Basename;
+use strict;
+
+my ($sec,$min,$hours,$mday,$mon,$year,$sj,$aj,$isdt) = localtime(time());
+  $year += 1900;
+  $mon +=1;
+  $mday = ( $mday  < 10 ) ? "0".$mday  : $mday ;
+  $mon  = ( $mon   < 10 ) ? "0".$mon   : $mon ;
+  $sec  = ( $sec   < 10 ) ? "0".$sec   : $sec ;
+  $min  = ( $min   < 10 ) ? "0".$min   : $min ;
+  $hours= ( $hours < 10 ) ? "0".$hours : $hours ;
+my ($now) = $year.$mon.$mday.$hours.$min.$sec.".0Z";
+
+my($date_temp) = substr($now,0,8);
+my($dateFR) = substr($date_temp,6,2).".".substr($date_temp,4,2).".".substr($date_temp,0,4);
+
+ ($sec,$min,$hours,$mday,$mon,$year,$sj,$aj,$isdt) = localtime(time()-1);
+  $year += 1900;
+  $mon +=1;
+  $mday = ( $mday  < 10 ) ? "0".$mday  : $mday ;
+  $mon  = ( $mon   < 10 ) ? "0".$mon   : $mon ;
+  $sec  = ( $sec   < 10 ) ? "0".$sec   : $sec ;
+  $min  = ( $min   < 10 ) ? "0".$min   : $min ;
+  $hours= ( $hours < 10 ) ? "0".$hours : $hours ;
+my ($now_1) = $year.$mon.$mday.$hours.$min.$sec.".0Z";
+
+
+my $suivi_console;
+my $traitement = 0;
+my(%roiconfigs); my(%options); 
+my ($scriptname,$thisDir,$thisExt);
+my($fic_out);      # fichier de sortie ldif en option -o (optionnel)
+my($fic_in);       # fichier en entrée (optionnel)
+my($fic_logs);     # fichier de sortie log en option -l (optionnel)
+my($fic_ldif);     # fichier ldif en sortie à charger
+my($fic_config);   # fichier de config en option -c (optionnel)
+my($LFILESRep);    # répertoire de sortie du fichier CSV généré
+my($LDIFRep);      # répertoire de sortie des fichiers ldif générés par les accès recherche annuaire
+my($rHome) = "";   # répertoire de script
+my($scope, $basedn, $filter, $ldif, @attributes);
+my %views; my %peps; my %people; my %roles_peps; my %manager; my %collab; my %people_roig;
+my $msg; my $key; my $ligne; my $i; my $j; my $temp; my $ok1; my $ok2;
+my @tab=();
+#my $firstlocality;
+#my $creatorsname;
+#my $axaadisplaylabel1;
+#my $axaanumversion_principal;
+#my $axaanumversion_complementaire;
+my $rolepepsprincipal = ""; my $cn_rolepepsprincipal;
+my $rolepepscomplementaire = ""; my $cn_rolepepscomplementaire;
+my $date_effet_role; my $date_fin_role;
+# +EFR - SER241565-V2
+my(%destinataires);
+my @dest;
+# -EFR - SER241565-V2
+
+######################################################################################
+#          Début du Main
+######################################################################################
+
+initialisation();
+
+
+######################################################################################
+##    Récupération des Views ROIG                                                  ##
+######################################################################################
+
+# Views : %views
+$scope      = "oneLevel";
+$basedn     = "OU=Views,OU=ROIG,O=AXA-France,O=axa";
+$filter     = "(&(axaastartdate<=$now)(axaaenddate>=$now)(axaaenumrelation=depend de))";
+$ldif       = $LDIFRep."views_roig.ldif";
+@attributes = ("objectclass","axaacreatorsname","axaaenum2","axaacompany","axaaenum1","axaafirstlocalityname","axaaclassrelation","axaaclass2","axaaenddate","axaaclass1","dn","axaaenumrelation","axaaid","axaastartdate","axaaobj2","axaaenumaxe","axaaobj1","axaadisplaylabel2","axaadisplaylabel1","axaanumversion");
+
+if ($suivi_console > 0) {print "\n- ".localtime(time())." - Recherche des Views dans le ROIG\n";}
+if ($suivi_console > 0) {print "filter : [" . $filter . "]\n";}
+
+
+#parametres de ldapsearch : ($host,$port,$binddn,$bindpwd,$scope,$basedn,$filter,$ldif,$searchType,@attributes)
+if (!exists $options{t})
+{
+  if (exists $options{s})
+  {
+  	$scope = "one";
+  	&ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldapsearch",@attributes);
+  }
+  else
+  {
+    &ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldifde",@attributes);
+  }
+}
+else
+{
+	print FLOGS "- ".localtime(time())." - " . " Utilisation du LDIF genere precedemment.\n";
+	if ($suivi_console > 0)
+	{
+		print "Utilisation du fichier LDIF genere precedemment\n";
+	}
+}
+
+%views = &ldif2hash($ldif,"axaaobj1");
+
+if ($suivi_console > 0)
+{
+	print "Fichier ldif : '$ldif'\n";
+}
+
+
+######################################################################################
+##    Récupération des managers dans le ROIC                                        ##
+######################################################################################
+
+# Managers : %manager
+$scope      = "oneLevel";
+$basedn     = "OU=People,OU=ROIC,O=AXA-France,O=axa";
+$filter     = "(axaaenumperson=salarie)";
+$ldif       = $LDIFRep."manager_ROIC.ldif";
+@attributes = ("manager","uid");
+
+if ($suivi_console > 0) {print "\n- ".localtime(time())." - Recherche des managers dans le ROIC\n";}
+if ($suivi_console > 0) {print "filter : [" . $filter . "]\n";}
+
+
+#parametres de ldapsearch : ($host,$port,$binddn,$bindpwd,$scope,$basedn,$filter,$ldif,$searchType,@attributes)
+if (!exists $options{t})
+{
+  if (exists $options{s})
+  {
+  	$scope = "one";
+  	&ldapSearch($roiconfigs{hostc},$roiconfigs{portc},$roiconfigs{BATCHCOHROIC},$roiconfigs{bindpasswdc},
+  							$scope, $basedn, $filter, $ldif, "ldapsearch",@attributes);
+  }
+  else
+  {
+    &ldapSearch($roiconfigs{hostc},$roiconfigs{portc},$roiconfigs{BATCHCOHROIC},$roiconfigs{bindpasswdc},
+  							$scope, $basedn, $filter, $ldif, "ldifde",@attributes);
+  }
+}
+else
+{
+	print FLOGS "- ".localtime(time())." - " . " Utilisation du LDIF genere precedemment.\n";
+	if ($suivi_console > 0)
+	{
+		print "Utilisation du fichier LDIF genere precedemment\n";
+	}
+}
+
+%manager = &ldif2hashlist($ldif,"manager");
+
+if ($suivi_console > 0)
+{
+	print "Fichier ldif : '$ldif'\n";
+}
+
+
+
+######################################################################################
+##    Récupération des Views ROIG Roles PEPS                                        ##
+######################################################################################
+
+# Rôles PEPS des views : %peps
+$scope      = "oneLevel";
+$basedn     = "OU=Views,OU=ROIG,O=AXA-France,O=axa";
+$filter     = "(&(axaaenumaxe=peps)(axaaenddate>=$now))";
+$ldif       = $LDIFRep."views_peps_roig.ldif";
+@attributes = ("objectclass","axaacreatorsname","axaaenum2","axaacompany","axaaenum1","axaafirstlocalityname","axaaclassrelation","axaaclass2","axaaenddate","axaaclass1","dn","axaaenumrelation","axaaid","axaastartdate","axaaobj2","axaaenumaxe","axaaobj1","axaadisplaylabel2","axaadisplaylabel1","axaanumversion");
+
+if ($suivi_console > 0) {print "\n- ".localtime(time())." - Recherche des rôles PEPS dans les views du ROIG\n";}
+if ($suivi_console > 0) {print "filter : [" . $filter . "]\n";}
+
+
+#parametres de ldapsearch : ($host,$port,$binddn,$bindpwd,$scope,$basedn,$filter,$ldif,$searchType,@attributes)
+if (!exists $options{t})
+{
+  if (exists $options{s})
+  {
+  	$scope = "one";
+  	&ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldapsearch",@attributes);
+  }
+  else
+  {
+    &ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldifde",@attributes);
+  }
+}
+else
+{
+	print FLOGS "- ".localtime(time())." - " . " Utilisation du LDIF genere precedemment.\n";
+	if ($suivi_console > 0)
+	{
+		print "Utilisation du fichier LDIF genere precedemment\n";
+	}
+}
+
+%peps = &ldif2hashlist($ldif,"axaaobj1");
+
+if ($suivi_console > 0)
+{
+	print "Fichier ldif : '$ldif'\n";
+}
+
+
+######################################################################################
+##    Récupération des Roles PEPS                                                   ##
+######################################################################################
+
+# Roles PEPS : %roles_peps
+$scope      = "oneLevel";
+$basedn     = "OU=Enums, OU=Types, OU=ROIG, O=AXA-France, o=axa";
+#$filter     = "(&(axaastartdate<=$now)(axaaenddate>=$now)(axaaclass=rolepeps))";
+$filter     = "(&(axaaenddate>=$now)(axaaclass=rolepeps))";
+$ldif       = $LDIFRep."enum_peps_roig.ldif";
+@attributes = ("cn","description","axaaenumlist");
+
+if ($suivi_console > 0) {print "\n- ".localtime(time())." - Recherche des Roles PEPS dans le ROIG\n";}
+if ($suivi_console > 0) {print "filter : [" . $filter . "]\n";}
+
+
+#parametres de ldapsearch : ($host,$port,$binddn,$bindpwd,$scope,$basedn,$filter,$ldif,$searchType,@attributes)
+if (!exists $options{t})
+{
+  if (exists $options{s})
+  {
+  	$scope = "one";
+  	&ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldapsearch",@attributes);
+  }
+  else
+  {
+    &ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldifde",@attributes);
+  }
+}
+else
+{
+	print FLOGS "- ".localtime(time())." - " . " Utilisation du LDIF genere precedemment.\n";
+	if ($suivi_console > 0)
+	{
+		print "Utilisation du fichier LDIF genere precedemment\n";
+	}
+}
+
+#Ce qui nous est fourni dans le fichier d'entrée est le libellé du rôle; donc la description
+#Dans les views, ce sera le cn qui sera renseigné, d'où la hashliste sur la clef description
+%roles_peps = &ldif2hash($ldif,"cn");
+
+if ($suivi_console > 0)
+{
+	print "Fichier ldif : '$ldif'\n";
+}
+
+
+
+######################################################################################
+##    Récupération des People                                                       ##
+######################################################################################
+
+# Conformément aux spec fonctionnelles fournies, nous ne récupérons que les salariés sen CDI
+# People : %people
+$scope      = "oneLevel";
+$basedn     = "OU=People, OU=ROIC, O=AXA-France, o=axa";
+# +EFR SER241565
+#$filter     = "(&(axaaenumperson=salarie)(axaahierarchieman=*\$AXA FRANCE SERVICES\$*)(axaacodenaturecontrat=cdi))";
+#$filter     = "(|(&(axaaenumperson=salarie)(axaahierarchieman=*\$AXA FRANCE SERVICES\$*)(axaacodenaturecontrat=cdi))(&(axaaenumperson=salarie)(axaahierarchieman=AXA FRANCE SERVICES\$*)(axaacodenaturecontrat=cdi)))";
+$filter     = "(|(&(axaaenumperson=salarie)(axaahierarchiemanid=*\$042155\$*)(axaacodenaturecontrat=cdi))(&(axaaenumperson=salarie)(axaahierarchiemanid=042155\$*)(axaacodenaturecontrat=cdi)))";
+# -EFR SER241565
+$ldif       = $LDIFRep."people_roic.ldif";
+@attributes = ("uid","sn","givenname","title","axaaadministrativeclasscode","axaabudgetaryou","manager","axaalibellesite","ou","axaacodenaturecontrat");
+
+if ($suivi_console > 0) {print "\n- ".localtime(time())." - Recherche des People dans le ROIC\n";}
+if ($suivi_console > 0) {print "filter : [" . $filter . "]\n";}
+
+
+#parametres de ldapsearch : ($host,$port,$binddn,$bindpwd,$scope,$basedn,$filter,$ldif,$searchType,@attributes)
+if (!exists $options{t})
+{
+  if (exists $options{s})
+  {
+  	$scope = "one";
+  	&ldapSearch($roiconfigs{hostc},$roiconfigs{portc},$roiconfigs{BATCHCOHROIC},$roiconfigs{bindpasswdc},
+  							$scope, $basedn, $filter, $ldif, "ldapsearch",@attributes);
+  }
+  else
+  {
+    &ldapSearch($roiconfigs{hostc},$roiconfigs{portc},$roiconfigs{BATCHCOHROIC},$roiconfigs{bindpasswdc},
+  							$scope, $basedn, $filter, $ldif, "ldifde",@attributes);
+  }
+}
+else
+{
+	print FLOGS "- ".localtime(time())." - " . " Utilisation du LDIF genere precedemment.\n";
+	if ($suivi_console > 0)
+	{
+		print "Utilisation du fichier LDIF genere precedemment\n";
+	}
+}
+
+%people = &ldif2hash($ldif,"uid");
+
+if ($suivi_console > 0)
+{
+	print "Fichier ldif : '$ldif'\n";
+}
+
+
+
+######################################################################################
+##    Récupération des People du ROIG pour la date de sortie                        ##
+######################################################################################
+
+# Conformément aux spec fonctionnelles fournies, nous ne récupérons que les salariés sen CDI
+# People : %people_roig
+$scope      = "oneLevel";
+$basedn     = "OU=People, OU=ROIG, O=AXA-France, o=axa";
+$filter     = "(&(axaastartdate<=$now)(axaaenddate>=$now))";
+$ldif       = $LDIFRep."people_roig.ldif";
+@attributes = ("cn","axaaenddate");
+
+if ($suivi_console > 0) {print "\n- ".localtime(time())." - Recherche des People dans le ROIG\n";}
+if ($suivi_console > 0) {print "filter : [" . $filter . "]\n";}
+
+
+#parametres de ldapsearch : ($host,$port,$binddn,$bindpwd,$scope,$basedn,$filter,$ldif,$searchType,@attributes)
+if (!exists $options{t})
+{
+  if (exists $options{s})
+  {
+  	$scope = "one";
+  	&ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldapsearch",@attributes);
+  }
+  else
+  {
+    &ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldifde",@attributes);
+  }
+}
+else
+{
+	print FLOGS "- ".localtime(time())." - " . " Utilisation du LDIF genere precedemment.\n";
+	if ($suivi_console > 0)
+	{
+		print "Utilisation du fichier LDIF genere precedemment\n";
+	}
+}
+
+%people_roig = &ldif2hash($ldif,"cn");
+
+if ($suivi_console > 0)
+{
+	print "Fichier ldif : '$ldif'\n";
+}
+
+# +EFR - SER241565-V2
+######################################################################################
+##         Récupération des destinataires                                           ##
+######################################################################################
+
+$scope      = "oneLevel";
+$basedn     = "OU=Enums,OU=Types,OU=ROIG,O=AXA-France,O=axa";
+$filter     = "(&(cn=DestinatairesExtractions)(axaaenddate>=$now))";
+$ldif       = $LDIFRep."destinatairesRolePepsROI.ldif";
+@attributes = ("cn","axaaenumlist");
+
+if ($suivi_console > 0) {print "\n- ".localtime(time())." - Recherche des destinataires dans le ROIG\n";}
+if ($suivi_console > 0) {print "filter : [" . $filter . "]\n";}
+
+#parametres de ldapsearch : ($host,$port,$binddn,$bindpwd,$scope,$basedn,$filter,$ldif,$searchType,@attributes)
+if (!exists $options{t})
+{
+  if (exists $options{s})
+  {
+  	$scope = "one";
+  	&ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldapsearch",@attributes);
+  }
+  else
+  {
+    &ldapSearch($roiconfigs{host},$roiconfigs{port},$roiconfigs{SYNCMAN},$roiconfigs{bindpasswd},
+  							$scope, $basedn, $filter, $ldif, "ldifde",@attributes);
+  }
+}
+else
+{
+	print FLOGS "- ".localtime(time())." - " . " Utilisation du LDIF genere precedemment.\n";
+	if ($suivi_console > 0)
+	{
+		print "Utilisation du fichier LDIF genere precedemment\n";
+	}
+}
+
+%destinataires = &ldif2hash($ldif,"cn");
+
+if ($suivi_console > 0)
+{
+	print "Fichier ldif : '$ldif'\n";
+}
+
+print FLOGS "Destinataires extraits\n";
+
+# -EFR - SER241565-V2
+
+
+
+######################################################################################
+##    Début du traitement                                                           ##
+######################################################################################
+
+# Entete
+$msg = "Matricule;Nom;Prénom;Fonction;Classe;Date d'effet des rôles;Date de fin des rôles;Rôle principal;";
+$msg .= " Rôle complémentaire;Section budgétaire;";
+$msg .= "Localisation/Site;Domaine;Département;Direction;Nom du N+1;Nombre de collaborateurs encadrés;";
+$msg .= "Date de sortie;Cohérence rôle/fonction;Cohérence rôle complémentaire/rôle principal\n";
+
+print CSV $msg;
+
+# Corps
+print FLOGS "###############################\n";
+foreach $key (keys %people)
+{
+#	if (defined $peps{lc($key)}[0]{"axaaobj2"})
+#	{
+		# Il y a au moins un rôle PEP'S, on va donc afficher les informations dans le CSV
+		print FLOGS $key."\n";
+		$rolepepsprincipal = "";
+		$rolepepscomplementaire = "";
+		$cn_rolepepsprincipal = "";
+		$cn_rolepepscomplementaire = "";
+		$date_effet_role = "";
+		$date_fin_role = "";
+		$msg = $key.";";
+		$msg .= $people{lc($key)}{"sn"}[0].";";
+		$msg .= $people{lc($key)}{"givenname"}[0].";";
+		$msg .= $people{lc($key)}{"title"}[0].";";
+		$msg .= $people{lc($key)}{"axaaadministrativeclasscode"}[0].";";
+		
+		# On récupère le(s) rôle(s) pep's disponible(s)
+		
+		$i = 0;
+		while (defined $peps{lc($key)}[$i]{"axaaobj2"})
+		{
+			if (defined $peps{lc($key)}[$i]{"axaaobj2"}[0])
+			{
+				if (lc($peps{lc($key)}[$i]{"axaaenumrelation"}[0]) eq "a pour role peps principal")
+				{
+					$rolepepsprincipal = $roles_peps{$peps{lc($key)}[$i]{"axaaobj2"}[0]}{"description"}[0];
+					$cn_rolepepsprincipal = $peps{lc($key)}[$i]{"axaaobj2"}[0];
+					print FLOGS "role principal : ".$rolepepsprincipal."\n";
+					if ($date_effet_role eq "")
+					{
+						$date_effet_role = $peps{lc($key)}[$i]{"axaastartdate"}[0];
+					}
+					if ($date_fin_role eq "")
+					{
+						$date_fin_role = $peps{lc($key)}[$i]{"axaaenddate"}[0];
+					}
+				}
+				elsif (lc($peps{lc($key)}[$i]{"axaaenumrelation"}[0]) eq "a pour role peps complementaire")
+				{
+					$rolepepscomplementaire = $roles_peps{$peps{lc($key)}[$i]{"axaaobj2"}[0]}{"description"}[0];
+					$cn_rolepepscomplementaire = $peps{lc($key)}[$i]{"axaaobj2"}[0];
+					print FLOGS "role complementaire : ".$rolepepscomplementaire."\n";
+					if ($date_effet_role eq "")
+					{
+						$date_effet_role = $peps{lc($key)}[$i]{"axaastartdate"}[0];
+					}
+					if ($date_fin_role eq "")
+					{
+						$date_fin_role = $peps{lc($key)}[$i]{"axaaenddate"}[0];
+					}
+				}
+			}
+			$i++;
+		}
+		if ($date_effet_role ne "")
+		{
+			$msg .= substr($date_effet_role,6,2)."/".substr($date_effet_role,4,2)."/".substr($date_effet_role,0,4).";";
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		
+		if ($date_fin_role ne "")
+		{
+			$msg .= substr($date_fin_role,6,2)."/".substr($date_fin_role,4,2)."/".substr($date_fin_role,0,4).";";
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		
+		if ($rolepepsprincipal ne "")
+		{
+			$msg .= $rolepepsprincipal.";";
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		if ($rolepepscomplementaire ne "")
+		{
+			$msg .= $rolepepscomplementaire.";";
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		if (defined $people{lc($key)}{"axaabudgetaryou"})
+		{
+			$msg .= $people{lc($key)}{"axaabudgetaryou"}[0].";";
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		if (defined $people{lc($key)}{"axaalibellesite"})
+		{
+			$msg .= $people{lc($key)}{"axaalibellesite"}[0].";";
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		
+		# Récupération de la pyramide managériale
+		# unité managériale courante de la personne
+		
+		if (defined $people{lc($key)}{"ou"})
+		{
+			$temp = $people{lc($key)}{"ou"}[0];
+			#print "a".$temp."\n";
+			while ((defined $views{lc($temp)}{"axaaobj2"})&&((lc($views{lc($temp)}{"axaaenum1"}[0]) ne "domaine")&&(lc($views{lc($temp)}{"axaaenum1"}[0]) ne "departement")&&(lc($views{lc($temp)}{"axaaenum1"}[0]) ne "direction"))) #+CL+ le 03/10/2007
+			{
+				$temp = $views{lc($temp)}{"axaaobj2"}[0];
+				#print "b".$temp."\n";
+			}
+			
+			if (lc($views{lc($temp)}{"axaaenum1"}[0]) eq "domaine")
+			{
+				#$msg .= $temp.";";
+				$msg .= $views{lc($temp)}{"axaadisplaylabel1"}[0].";";
+				# Cas particulier où le domaine est directement rattaché à une direction
+				if ((defined $views{lc($temp)}{"axaaobj2"})&&(lc($views{lc($temp)}{"axaaenum2"}[0]) eq "direction"))
+				{
+					$temp = $views{lc($temp)}{"axaaobj2"}[0];
+					#$msg .= ";".$temp.";";
+					$msg .= ";".$views{lc($temp)}{"axaadisplaylabel1"}[0].";";
+				}
+				else
+				{
+					# Cas général où il existe un département
+					while ((defined $views{lc($temp)}{"axaaobj2"})&&(lc($views{lc($temp)}{"axaaenum1"}[0]) ne "departement"))
+					{
+						$temp = $views{lc($temp)}{"axaaobj2"}[0];
+						#print "c".$temp."\n";
+					}
+					if (lc($views{lc($temp)}{"axaaenum1"}[0]) eq "departement")
+					{
+						#$msg .= $temp.";";
+						$msg .= $views{lc($temp)}{"axaadisplaylabel1"}[0].";";
+						while ((defined $views{lc($temp)}{"axaaobj2"})&&(lc($views{lc($temp)}{"axaaenum1"}[0]) ne "direction"))
+						{
+							$temp = $views{lc($temp)}{"axaaobj2"}[0];
+							#print "d".$temp."\n";
+						}
+						if (lc($views{lc($temp)}{"axaaenum1"}[0]) eq "direction")
+						{
+							#$msg .= $temp.";";
+							$msg .= $views{lc($temp)}{"axaadisplaylabel1"}[0].";";
+						}
+						else
+						{
+							$msg .= ";";
+						}
+					}
+					else
+					{
+						$msg .= ";;";
+					}
+				}
+			}
+			# +CL+ le 03/10/2007
+			# cas où la personne courante est rattachée directement à un département
+			elsif (lc($views{lc($temp)}{"axaaenum1"}[0]) eq "departement")
+			{
+				$msg .= ";";
+				$msg .= $views{lc($temp)}{"axaadisplaylabel1"}[0].";";
+				# Cas général où le département est rattaché à une direction
+				if ((defined $views{lc($temp)}{"axaaobj2"})&&(lc($views{lc($temp)}{"axaaenum2"}[0]) eq "direction"))
+				{
+					$msg .= $views{lc($temp)}{"axaadisplaylabel2"}[0].";";
+				}
+				else
+				{
+					$msg .= ";";
+				}
+			}
+			elsif (lc($views{lc($temp)}{"axaaenum1"}[0]) eq "direction")
+			{
+				$msg .= ";;".$views{lc($temp)}{"axaadisplaylabel1"}[0].";";
+			}
+			# -CL- le 03/10/2007
+			# cas où la personne est directement rattachée à une direction
+			else
+			{
+				$msg .= ";;;";
+			}
+		}
+		else
+		{
+			$msg .= ";;;";
+		}
+		# Fin de la récupération et de l'affichage de la pyr managériale
+		
+		# Récupération du manager
+		$temp = "";
+		if (defined $people{lc($key)}{"manager"})
+		{
+			$temp = $people{lc($key)}{"manager"}[0];
+			print FLOGS "Manager : ".$temp."->";
+			$temp =~ s/^uid\=//;
+			$temp =~ s/\,.*//;
+			print FLOGS $temp."\n";
+			if ((defined $people{lc($temp)}{"sn"})&&(defined $people{lc($temp)}{"givenname"}))
+			{
+				$msg .= $people{lc($temp)}{"givenname"}[0]." ".$people{lc($temp)}{"sn"}[0].";"
+			}
+			else
+			{
+				$msg .= ";";
+			}
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		
+		# Fin de récupération du manager
+		
+		# Affichage du nombre de collaborateurs encadrés
+		# On travaille sur le ROIC, et on recherche toutes les personnes qui ont la personne courante comme manager
+		$i = 0;
+		$temp = "uid=".$key.",OU=People,OU=ROIC,O=AXA-France,O=axa";
+		while ((defined $manager{lc($temp)}[$i]{"uid"})&&(defined $manager{lc($temp)}[$i]{"uid"}[0]))
+		{
+			$i++;
+		}
+		$msg .= $i.";";
+		# Fin de l'affichage du nombre de collaborateurs encadrés
+		
+		# Affichage de la date de sortie si celle-ci est indiquée
+		if ($people_roig{lc($key)}{"axaaenddate"}[0] ne "99991231235959.0Z")
+		{
+			$msg .= substr($people_roig{lc($key)}{"axaaenddate"}[0],6,2)."/".substr($people_roig{lc($key)}{"axaaenddate"}[0],4,2)."/".substr($people_roig{lc($key)}{"axaaenddate"}[0],0,4).";";
+		}
+		else
+		{
+			$msg .= ";";
+		}
+		# Fin de l'affichage de la date de sortie
+		
+		
+		# Début des contrôles
+		
+		# Contrôle de cohérence entre rôle et fonction
+		$ok1 = "non";
+		$ok2 = "non";
+		# Contrôle sur le rôle principal
+		print FLOGS "Contrôle rôle/fonction-classe\n";
+		if ($cn_rolepepsprincipal ne "")
+		{
+			$i = 0;
+			print FLOGS "Rôle principal corresp : ";
+			while (defined $roles_peps{$cn_rolepepsprincipal}{"axaaenumlist"}[$i])
+			{
+				@tab = split(/\|/,$roles_peps{$cn_rolepepsprincipal}{"axaaenumlist"}[$i]);
+				if ((lc($tab[0]) eq lc($people{lc($key)}{"title"}[0]))&&(lc($tab[1]) eq lc($people{lc($key)}{"axaaadministrativeclasscode"}[0])))
+				{
+					# On a trouvé une correspondance pour le rôle principal, avec la fonction et la classe de
+					# la personne courante
+					$ok1 = "oui";
+				}
+				print FLOGS lc($tab[0])." - ".lc($people{lc($key)}{"title"}[0])." , ".lc($tab[1])." - ".lc($people{lc($key)}{"axaaadministrativeclasscode"}[0])." | ";
+				$i++;
+			}
+			if ($ok1 eq "oui")
+			{
+				print FLOGS "\nrôle principal : correspondance ok\n";
+			}
+			else
+			{
+				print FLOGS "\nrôle principal : correspondance pas ok\n";
+			}
+		}
+		else
+		{
+			$ok1="oui";
+			print FLOGS "rôle principal : vide => correspondance ok\n";
+		}
+		
+		# Contrôle sur le rôle complémentaire
+		
+		if ($cn_rolepepscomplementaire ne "")
+		{
+			$i = 0;
+			print FLOGS "Rôle complémentaire corresp : ";
+			while (defined $roles_peps{$cn_rolepepscomplementaire}{"axaaenumlist"}[$i])
+			{
+				@tab = split(/\|/,$roles_peps{$cn_rolepepscomplementaire}{"axaaenumlist"}[$i]);
+				if ($tab[1] >= $people{lc($key)}{"axaaadministrativeclasscode"}[0])
+				{
+					# On a trouvé une correspondance pour le rôle complémentaire, avec la fonction et la classe de
+					# la personne courante
+					$ok2 = "oui";
+				}
+				print FLOGS lc($tab[0])." - ".lc($people{lc($key)}{"title"}[0])." , ".lc($tab[1])." - ".lc($people{lc($key)}{"axaaadministrativeclasscode"}[0])." | ";
+				$i++;
+			}
+			if ($ok2 eq "oui")
+			{
+				print FLOGS "\nrôle complémentaire : correspondance ok\n";
+			}
+			else
+			{
+				print FLOGS "\nrôle complémentaire : correspondance pas ok\n";
+			}
+		}
+		else
+		{
+			$ok2 = "oui";
+			print FLOGS "rôle complémentaire : vide => correspondance ok\n";
+		}
+		
+		
+		if (($ok1 eq "oui")&&($ok2 eq "oui"))
+		{
+			$msg .= "oui;";
+		}
+		else
+		{
+			$msg .= "non;";
+		}
+		# Contrôle de cohérence entre rôle complémentaire et rôle principal
+		print FLOGS "---------------\nContrôle cohérence rôle principal/rôle complémentaire\n";
+		if ($cn_rolepepsprincipal ne "")
+		{
+			# Le Rôle pep's principal est renseigné
+			if ($cn_rolepepscomplementaire eq "")
+			{
+				# Le rôle complémentaire n'est pas rensigné
+				$msg .= "oui;";
+				print FLOGS "Rôles principal renseigné et rôle complémentaires vide => cohérence ok\n";
+			}
+			elsif ($cn_rolepepsprincipal eq $cn_rolepepscomplementaire)
+			{
+				# Les 2 rôles sont les mêmes
+				$msg .= "non;";
+				print FLOGS "Rôles principal et complémentaire égaux => cohérence pas ok\n";
+			}
+			else
+			{
+				# Les rôles sont différents, et tous 2 renseignés
+				$msg .= "oui;";
+				print FLOGS "Rôles principal et complémentaire rensignés et différents => cohérence ok\n";
+			}
+		}
+		else
+		{
+			if ($cn_rolepepscomplementaire ne "")
+			{
+				# Rôle pep's principal non renseigné et rôle pep's complémentaire renseigné
+				$msg .= "non;";
+				print FLOGS "Rôles principal vide et rôle complémentaire renseigné => cohérence pas ok\n";
+			}
+			else
+			{
+				# Les 2 rôles ne sont pas renseignés
+				$msg .= "oui;";
+				print FLOGS "Rôles principal et complémentaire vides => cohérence ok\n";
+			}
+		}
+		
+		# Fin des contrôles
+		print FLOGS "Fin des contrôles\n###############################\n";
+		$msg .= "\n";
+		print CSV $msg;
+#	}
+#	else
+#	{
+#		print FLOGS $key." ignorée car aucun rôle PEP'S\n";
+#		print FLOGS "###############################\n";
+#	}
+}
+
+close(CSV);
+
+# Envoi du mail
+
+print FLOGS "nom script".$scriptname."\n";
+
+
+if ($roiconfigs{'ENVT'} eq "DEV")
+{
+	my($subject) = "Extraction des rôles PEP'S ROI du ".$dateFR;
+	my($body) = "Envoi automatique.\n\n$subject en pièce jointe.";
+	my($mailFrom) = "service.moeroi\@axa.fr";
+	my($realName) = "Service ROI";
+	my($file) = $fic_out;
+	my $contentType; my $replyTo;
+	$contentType = $replyTo = "";
+	#my $to  = "cyril.lepretre.businessdecision\@axa.fr;mathieu.baranger.businessdecision\@axa.fr";
+	my $to  = "estelle.frelat.eds\@axa.fr";
+	my $cc = "service.moeroi\@axa.fr";
+	my $bcc = "";
+	print FLOGS "Envoie du fichier ".$file." par mail\n";
+	print FLOGS "  - Serveur SMTP : ".$roiconfigs{'smtpsrv'}."\n";
+	&sendmail($roiconfigs{'smtpsrv'},$subject,$body,$mailFrom,$realName,$replyTo,$to,$cc,$bcc,$contentType,$file);
+}
+elsif ($roiconfigs{'ENVT'} eq "PRE-PROD")
+{
+	my($subject) = "Extraction des rôles PEP'S ROI du ".$dateFR;
+	my($body) = "Envoi automatique.\n\n$subject en pièce jointe.";
+	my($mailFrom) = "service.moeroi\@axa.fr";
+	my($realName) = "Service ROI";
+	my($file) = $fic_out;
+	my $contentType; my $replyTo;
+	$contentType = $replyTo = "";
+	my $to  = "antoine.spyridakis\@axa.fr;service.roi\@axa.fr";
+	my $cc = "service.moeroi\@axa.fr";
+	my $bcc = "";
+	print FLOGS "Envoie du fichier ".$file." par mail\n";
+	print FLOGS "  - Serveur SMTP : ".$roiconfigs{'smtpsrv'}."\n";
+	&sendmail($roiconfigs{'smtpsrv'},$subject,$body,$mailFrom,$realName,$replyTo,$to,$cc,$bcc,$contentType,$file);
+}
+elsif ($roiconfigs{'ENVT'} eq "PROD")
+{
+	my($subject) = "Extraction des rôles PEP'S ROI du ".$dateFR;
+	my($body) = "Envoi automatique.\n\n$subject en pièce jointe.";
+	my($mailFrom) = "service.moeroi\@axa.fr";
+	my($realName) = "Service ROI";
+	my($file) = $fic_out;
+	my $contentType; my $replyTo;
+	$contentType = $replyTo = "";
+	# +EFR - SER241565-V2
+	# Liste des personnes destinatrices du mail
+	my $to = "";
+	$i = 0;
+	while (defined $destinataires{"destinatairesextractions"}{"axaaenumlist"}[$i])
+	{
+		@dest = split(/\|/,$destinataires{"destinatairesextractions"}{"axaaenumlist"}[$i]);
+		
+		if (lc($dest[0]) eq lc($scriptname))
+		{
+			$to .= $dest[1].";";
+			#print $dest[1]."\n";
+		}
+		$i ++;
+	}	
+	# -EFR - SER241565-V2
+	# On garde la boite service MOEROI en copie du mail
+	my $cc = "service.moeroi\@axa.fr";
+	my $bcc = "";
+	print FLOGS "Envoie du fichier ".$file." par mail\n";
+	print FLOGS "  - Serveur SMTP : ".$roiconfigs{'smtpsrv'}."\n";
+	print FLOGS "Destinataires : ".$to.";";
+	print FLOGS "\nEmail envoyé\n\n";
+	&sendmail($roiconfigs{'smtpsrv'},$subject,$body,$mailFrom,$realName,$replyTo,$to,$cc,$bcc,$contentType,$file);
+}
+fin_traitement();
+
+######################################################################################
+######################################################################################
+##                                 FONCTIONS                                        ##
+######################################################################################
+######################################################################################
+
+######################################################################################
+##         Initialisation                                                           ##
+######################################################################################
+sub initialisation
+{
+	$rHome = $ENV{'HOME_SCRIPT'};
+	$rHome =~ s/\//\\/g;
+	#print "HOME : ".$rHome."\n";
+	($scriptname,$thisDir,$thisExt)= fileparse($0, qr/\..*/);
+	
+	#Récupération des options de la ligne de commande
+	if (!getopts('o:c:l:tsv', \%options)) {&usage($0);}
+	
+	$fic_config = $options{c} || ("$rHome\\etc\\config.txt");
+	%roiconfigs = &init($fic_config);
+	
+	$fic_logs = $options{l} || ("$rHome\\logs\\".$scriptname.".log");
+	&log("Couldn't open $fic_logs\n",1,$suivi_console) unless open(FLOGS,">".$fic_logs);
+	
+	$LDIFRep = "$rHome\\ldif\\";
+	$LFILESRep = "$rHome\\files\\";
+	
+	$fic_out = $options{o} || ($LFILESRep."extractionRolePEPS.csv");
+	&log("Couldn't open $fic_out\n",1,$suivi_console) unless open(CSV,">".$fic_out);
+	
+	#$fic_ldif = ($LDIFRep.$scriptname."_out.ldif");
+	#&log("Couldn't open $fic_ldif\n",1,$suivi_console) unless open(LDIF,">".$fic_ldif);
+	
+	if (exists $options{v})
+	{$suivi_console = 1;} 
+	else 
+	{$suivi_console = 0;}
+	
+	print FLOGS  "___________________________________________________________________________\n\n";
+	print FLOGS  "   DEBUT  :  ".localtime((time))."\n";
+	print FLOGS  "config:  ".$fic_config." - " . localtime((time))."\n";
+	print FLOGS  "sortie:  ".$fic_out." - " . localtime((time))."\n";
+	print FLOGS  "logs:    ".$fic_logs." - " . localtime((time))."\n";
+	print FLOGS  "               _____________________________________________\n\n";
+	
+		
+	###################################################
+	# Initialisation du module AXA::utils et récupération des paramètres de connexion
+	###################################################
+
+	# paramètres de connexion ROIG
+	
+	#print scalar(keys %roiconfigs)." clefs configs\n";
+	if (!exists $roiconfigs{host})       {&log("Host not found in file ${fic_config}\n",1,$suivi_console);}
+	if (!exists $roiconfigs{port})       {&log("Port not found in file ${fic_config}\n",1,$suivi_console);}
+	if (!exists $roiconfigs{SYNCMAN})     {&log("SYNCMAN not found in file ${fic_config}\n",1,,$suivi_console);}
+	if (!exists $roiconfigs{bindpasswd}) {&log("bindpasswd not found in file ${fic_config}\n",1,$suivi_console);}
+}
+
+###########################################################################
+# FIN DE TRAITEMENT
+###########################################################################
+sub fin_traitement
+{
+	# displays de fin de traitement
+	if ($suivi_console > 0) {print "- FIN - ".localtime(time())."\n";}
+  
+  	print FLOGS  "               _____________________________________________\n\n";
+	print FLOGS  "   FIN  :  ".localtime((time))."\n";
+	print FLOGS  "___________________________________________________________________________\n\n";
+	
+	# fermeture des fichiers
+	#close CSV; #On ferme le CSV avant le reste, pour pouvoir loguer lors de l'envoi de mail
+	close LDIF;
+	close FLOGS;
+}
